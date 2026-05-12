@@ -1,26 +1,3 @@
-"""
-NSAI Core v4.1
-
-Изменения от v4.0:
-- (2) wm.stack убран — мёртвая структура. WM = состояние парсера + кэш сессии.
-- (3) Парсер больше не фабрикует IS_A (соседство NP) и ЧАСТЬ (генитив).
-      Свободные NP → entity. Связи между лемами должны идти из явного
-      сигнала (глагол, копула), а не из догадок интерпретатора.
-- (4) Колонка `context` убрана. Дедуп — глобальный. Счёт согласованности —
-      число distinct фактов, а не «независимых контекстов».
-- (5) coherence_score документирован как относительная мера, осмысленная
-      только в сравнении (между альтернативами одного обхода).
-- (7) Новый токенизатор. Числа и латиница получают леммы (= сам токен).
-- (9) process_answer пишет факт напрямую через save_fact, без text round-trip.
-- (10) Абдукция: верификация кандидата независимым обходом, исключающим
-       суггестирующие фреймы. Per-hole ranking, берётся top-1.
-
-⚠ Старая БД nsai_memory.db с колонкой context остаётся читаемой
-   (мы просто не пишем и не читаем эту колонку), но рекомендуется
-   удалить и перезалить корпус — иначе старые контекстно-разделённые
-   дубликаты дадут завышенные счёты.
-"""
-
 import re, json, sqlite3
 from collections import defaultdict
 from natasha import Segmenter, NewsEmbedding, NewsMorphTagger, NewsSyntaxParser, Doc as NatashaDoc
@@ -346,6 +323,23 @@ def floor_traversal(start_lemmas, *, cur, depth=3, query_lemmas=None):
 #  ЯДРО: analyze()
 # ═══════════════════════════════════════════
 
+def _is_transitive_verb(lemma, morph):
+    """Транзитивность через pymorphy3.grammemes. Единая точка определения.
+
+    Применяется к чистой лемме (без частицы-префикса): не_спать → спать.
+    Используется в analyze (детекция дыр при perceive) и scan_curiosity
+    (фоновый сбор дыр). Один архитектурный факт — одна реализация.
+    """
+    clean = lemma.rsplit('_', 1)[-1] if '_' in lemma else lemma
+    parses = morph._morph3.parse(clean)
+    if not parses:
+        return False
+    tag = parses[0].tag
+    if str(tag.POS) not in ('VERB', 'INFN'):
+        return False
+    return 'tran' in tag.grammemes
+
+
 def analyze(fact, args, *, cur, morph, preloaded=None):
     """Подтянуть граф, измерить согласованность, вернуть результат.
 
@@ -367,19 +361,13 @@ def analyze(fact, args, *, cur, morph, preloaded=None):
     confirmations = [a for a in associations
                      if a['type'] == 'relation' and a['fact'] == fact and set(a['args']) == args_set]
 
-    # Дыра: только транзитивный глагол с менее чем 2 аргументами.
-    # Берём основу составной леммы (не_спать → спать) и проверяем
-    # транзитивность через pymorphy3 grammemes — словарный lookup
-    # надёжен для одиночного глагола в нормальной форме.
+    # Дыра: транзитивный глагол с менее чем 2 аргументами.
+    # Транзитивность — _is_transitive_verb (pymorphy3.grammemes),
+    # единая точка реализации для analyze и scan_curiosity.
     holes = []
-    clean = fact.rsplit('_', 1)[-1] if '_' in fact else fact
-    toks = morph.analyze(clean)
-    if toks and toks[0].pos == 'VERB':
-        pm_parses = morph._morph3.parse(clean)
-        is_tran = pm_parses and 'tran' in pm_parses[0].tag.grammemes
-        if is_tran and len(args) < 2:
-            holes.append({'fact': fact, 'args': list(args),
-                          'missing': 'объект' if args else 'субъект + объект'})
+    if _is_transitive_verb(fact, morph) and len(args) < 2:
+        holes.append({'fact': fact, 'args': list(args),
+                      'missing': 'объект' if args else 'субъект + объект'})
 
     return {'framing': framing, 'associations': associations,
             'confirmations': confirmations, 'holes': holes}
@@ -533,18 +521,18 @@ def _run_parser(text, save_fn, wm, morph):
             used_ids.add(t.id)
 
     # ── 2. VERB-предикаты ──
-    def _tok_pos(tok_id):
-        """Числовая позиция токена для сортировки args по поверхностному порядку."""
-        try: return int(tok_id.split('_')[1])
-        except: return 0
-
+    # Порядок args: ролевой приоритет (nsubj → nsubj:pass → obj → iobj →
+    # obl → xcomp). Внутри роли — порядок возврата natasha, с сиблингами
+    # через conj/appos/nmod сразу после своей головы. Поверхностная
+    # позиция не используется: «Кот ест рыбу» и «Рыбу ест кот» дают
+    # один канонический ключ для дедупликации.
     for t in tokens:
         if t.id in used_ids: continue
         if t.pos != 'VERB' or t.rel in ('aux', 'cop'):
             continue
         pred = _get_lemma(t)
         all_lemmas.add(pred)
-        arg_pairs = []
+        args = []
 
         order = ('nsubj', 'nsubj:pass', 'obj', 'iobj', 'obl', 'xcomp')
         deps  = children.get(t.id, [])
@@ -556,12 +544,12 @@ def _run_parser(text, save_fn, wm, morph):
                         head = by_id.get(t.head_id)
                         if head and head.pos in ('NOUN', 'PROPN'):
                             arg_lemma = _get_lemma(head)
-                    arg_pairs.append((_tok_pos(c.id), arg_lemma))
+                    args.append(arg_lemma)
                     all_lemmas.add(arg_lemma)
                     used_ids.add(c.id)
                     for sibling in _collect_conj(c):
                         sib_lemma = _get_lemma(sibling)
-                        arg_pairs.append((_tok_pos(sibling.id), sib_lemma))
+                        args.append(sib_lemma)
                         all_lemmas.add(sib_lemma)
                         used_ids.add(sibling.id)
 
@@ -581,13 +569,10 @@ def _run_parser(text, save_fn, wm, morph):
                         break
             if head and head.pos in ('NOUN', 'PROPN'):
                 head_lemma = _get_lemma(head)
-                if head_lemma not in [p[1] for p in arg_pairs]:
-                    arg_pairs.append((_tok_pos(head.id), head_lemma))
+                if head_lemma not in args:
+                    args.append(head_lemma)
                     all_lemmas.add(head_lemma)
-            arg_pairs = [(p, l) for p, l in arg_pairs if l not in ('который', 'что', 'кто')]
-
-        arg_pairs.sort(key=lambda p: p[0])
-        args = [lemma for _, lemma in arg_pairs]
+            args = [l for l in args if l not in ('который', 'что', 'кто')]
 
         used_ids.add(t.id)
         for c in children.get(t.id, []):
@@ -746,24 +731,23 @@ def reason(text, _cursor=None, _conn=None,
     # При N = 1: фильтр не применяется (нечего пересекать).
     # Пустое пересечение → open-world fallback на весь граф.
     _n = len(query_lemmas)
-    _threshold = max(1, (_n + 1) // 2) if _n > 1 else 1
+    _threshold = max(2, (_n + 1) // 2) if _n > 1 else 1
     for a in all_associations:
         a['_cov'] = signal_coverage(a, query_lemmas)
     compressed = [a for a in all_associations if a['_cov'] >= _threshold]
     if not compressed:
         compressed = all_associations  # open-world: граф не знает ничего совместного
 
-    # Согласованность = сумма совместной активации фактов из compressed.
-    # Каждый факт вносит вклад пропорционально числу лемм сигнала,
-    # которые он одновременно активирует (_cov).
-    # Bridge-леммы усиливают score: каждая найденная цепочка добавляет
-    # свою силу (strength = произведение числа фактов в обеих ветках).
-    # Это делает score мерой совместного наблюдения, а не популярности
-    # отдельных лемм.
-    coherence_score = (
-        sum(a.get('_cov', 0) for a in compressed if a.get('_cov', 0) == _n)
-        + sum(c['strength'] for c in chains)
-    )
+    # Coherence score = direct_score + bridge_score, каждое в своих единицах.
+    # direct_score — число фактов с полным покрытием сигнала (_cov == N).
+    # bridge_score — число цепочек: bridge-лемма как общий сосед ≥2 query-лемм
+    # из непересекающихся стартовых веток.
+    # Сила отдельной цепочки (a_facts × b_facts) остаётся диагностическим
+    # показателем моста, но в score не входит, иначе популярные узлы
+    # графа тащат score без реального совместного наблюдения.
+    direct_score = sum(1 for a in compressed if a.get('_cov', 0) == _n)
+    bridge_score = len(chains)
+    coherence_score = direct_score + bridge_score
 
     # Tension — эмерджентный сигнал из traversal, не отдельный сканер.
     # Два факта в compressed об одном объекте с высоким _cov,
@@ -980,13 +964,7 @@ def scan_curiosity(*, cur=None, morph=None, limit=10):
 
     for (fact, aj) in rows:
         args = json.loads(aj)
-        clean = fact.rsplit('_', 1)[-1] if '_' in fact else fact
-        toks = morph.analyze(clean)
-        is_tran_verb = (
-            toks and toks[0].pos == 'VERB' and
-            dict(toks[0].feats or {}).get('VerbForm') in ('Fin', 'Inf', None)
-        )
-        if is_tran_verb and len(args) < 2:
+        if _is_transitive_verb(fact, morph) and len(args) < 2:
             framed = pull_framing(fact, args, cur=cur)
             cands = list({fa for fr in framed for fa in fr['args'] if fa not in args})
             if args:
