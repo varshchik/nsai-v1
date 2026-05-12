@@ -1079,9 +1079,12 @@ def print_stats():
 # ═══════════════════════════════════════════
 
 if __name__ == '__main__':
-    print("NSAI v4.1\n  ввод → perceive | ?ввод → reason | !load файл")
+    print("NSAI v4.1")
+    print("  <текст>       → perceive (запомнить)")
+    print("  ?<текст>      → reason (запрос)")
+    print("  !load <файл>  → загрузить корпус")
     print("  !clear — сброс сессии | !debug — отладка")
-    print("  !curiosity | !ask | @лемма | !stats | !cmp a || b\n")
+    print("  !curiosity | !ask | @<лемма> | !stats | !cmp a || b\n")
     pending, debug = None, False
     try:
         while True:
