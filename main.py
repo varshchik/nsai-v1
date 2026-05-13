@@ -438,10 +438,46 @@ def _run_parser(text, save_fn, wm, morph):
     Fallback: если дерево вырождено (NOUN root + VERB не-root) — короткое
     предложение natasha не разобрала. В этом случае извлекаем relation
     из VERB напрямую через позицию NP в тексте.
+
+    Sensor cross-check (natasha vs pymorphy3): natasha иногда мисклассифицирует
+    NOUN-instr как ADJ-amod из-за совпадения окончания -ом у NOUN.ablt.masc.inan
+    и ADJ.ablt.masc (зонтом, столом, окном). Структурный признак ошибки —
+    ADJ-amod с head→self или head→VERB (amod по UD должен висеть на NOUN).
+    Pymorphy3 на этих формах однозначен (часто score=1.0, единственный разбор).
+    Когда конфликт + pymorphy3 уверен в NOUN — перетегиваем токен и
+    прицепляем как obl к ближайшему VERB. Это применение принципа независимой
+    верификации (как в reason()/абдукции) к sensor-слою: natasha больше не
+    единственный источник истины.
     """
     tokens = morph.analyze(text)
     if not tokens:
         return set()
+
+    # ── Sensor cross-check на POS ──
+    _by_id_pre = {t.id: t for t in tokens}
+    for t in tokens:
+        if t.pos != 'ADJ' or t.rel != 'amod':
+            continue
+        is_self_head = (t.head_id == t.id)
+        head_pre = _by_id_pre.get(t.head_id)
+        head_is_verb = (head_pre is not None
+                        and head_pre.pos == 'VERB'
+                        and not is_self_head)
+        if not (is_self_head or head_is_verb):
+            continue
+        parses = morph._morph3.parse(t.text)
+        top = parses[0] if parses else None
+        if top is None or str(top.tag.POS) != 'NOUN' or top.score < 0.5:
+            continue
+        # pymorphy3 уверенно говорит NOUN — natasha-разбор отвергаем
+        t.pos = 'NOUN'
+        t.lemma = top.normal_form.lower()
+        t.rel = 'obl'
+        if is_self_head:
+            verb = next((tt for tt in tokens
+                        if tt.pos == 'VERB' and tt.rel not in ('aux', 'cop')), None)
+            if verb is not None:
+                t.head_id = verb.id
 
     by_id = {t.id: t for t in tokens}
     children = {}
