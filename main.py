@@ -724,19 +724,36 @@ def reason(text, _cursor=None, _conn=None,
                                               query_lemmas=query_lemmas)
     all_associations = [f for fl in floors for f in fl['facts']]
 
-    # Сжатие через заполнение сигнала.
-    # Каждой ассоциации присваивается coverage = число лемм запроса,
-    # одновременно присутствующих в args факта.
-    # При N > 1 лемме: выживают факты с coverage >= ceil(N/2).
-    # При N = 1: фильтр не применяется (нечего пересекать).
-    # Пустое пересечение → open-world fallback на весь граф.
+    # Сжатие сигнала. Два независимых пути:
+    # (1) прямое пересечение — факты, где >= threshold лемм сигнала
+    #     одновременно присутствуют в args/предикате;
+    # (2) мостовое — факты, поддерживающие найденные bridge-цепочки.
+    # Когда прямого пересечения нет, мост и есть compression через
+    # транзитивность. Силлогизм «Сократ — человек, человек смертен» —
+    # типовой случай: ни один факт не содержит {сократ, смертный}
+    # одновременно, но мост через `человек` даёт ровно те две записи,
+    # на которых держится вывод. Open-world (выгрузка всех ассоциаций)
+    # срабатывает только когда нет ни прямых, ни мостовых наблюдений —
+    # иначе сигнал из фильтра превращается в семя расширения и
+    # framing отрабатывает в обратную сторону.
     _n = len(query_lemmas)
     _threshold = max(2, (_n + 1) // 2) if _n > 1 else 1
     for a in all_associations:
         a['_cov'] = signal_coverage(a, query_lemmas)
-    compressed = [a for a in all_associations if a['_cov'] >= _threshold]
+
+    direct = [a for a in all_associations if a['_cov'] >= _threshold]
+
+    bridge_supports = []
+    seen_ids = {a['id'] for a in direct}
+    for c in chains:
+        for f in c['a_facts'] + c['b_facts']:
+            if f['id'] not in seen_ids:
+                seen_ids.add(f['id'])
+                bridge_supports.append(f)
+
+    compressed = direct + bridge_supports
     if not compressed:
-        compressed = all_associations  # open-world: граф не знает ничего совместного
+        compressed = all_associations  # open-world: ни прямых, ни мостовых наблюдений
 
     # Coherence score = direct_score + bridge_score, каждое в своих единицах.
     # direct_score — число фактов с полным покрытием сигнала (_cov == N).
