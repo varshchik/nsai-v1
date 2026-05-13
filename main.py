@@ -1074,7 +1074,7 @@ def print_stats():
 # ═══════════════════════════════════════════
 
 if __name__ == '__main__':
-    print("NSAI v4.1")
+    print("NSAI v0.1")
     print("  <текст>       → perceive (запомнить)")
     print("  ?<текст>      → reason (запрос)")
     print("  !load <файл>  → загрузить корпус")
